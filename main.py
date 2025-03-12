@@ -173,7 +173,7 @@ def stop_schedule(group_id):
 # ========== 5. 插件主体，结合打卡功能与多群定时发送功能 ==========
 
 @register(
-    name="DailyGoalsTracker",
+    name="DayNews",
     description="多群定时发送早报功能。",
     version="0.2",
     author="Rio"
