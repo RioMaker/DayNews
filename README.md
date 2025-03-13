@@ -12,4 +12,11 @@
 
 ## 使用
 
+### 申请token
+在
+[ALAPI](https://www.alapi.cn/)
+申请token填入插件中。
+
 输入 '/news' 时，获取API返回的新闻图片并发送。
+输入 '/news set hh:mm' 命令做每日定时推送。
+输入 '/news stop' 命令关闭定时推送。
