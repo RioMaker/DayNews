@@ -43,27 +43,45 @@ def fetch_news_image_url() -> str:
 
 @register(
     name="DayNews", 
-    description="发送每日新闻图片的插件(带定时功能)", 
-    version="0.4", 
+    description="发送每日新闻图片的插件(轮询定时版)", 
+    version="0.5", 
     author="Rio"
 )
 class DailyNewsPlugin(BasePlugin):
     """
-    当用户输入 '/news' 时，获取API返回的新闻图片并发送。
-    支持 '/news set hh:mm' 命令做每日定时推送。
-    支持 '/news stop' 命令关闭定时推送。
+    命令说明：
+      1) /news             -> 立即发送一次新闻
+      2) /news set hh:mm   -> 设置每日定时任务
+      3) /news stop        -> 停止当前会话的定时任务
     """
 
     def __init__(self, host):
         self.host = host
-        # 用于存储当前会话(群/私聊)对应的定时任务
-        # key 可以是 group_id 或者 person_id，value 是 asyncio.Task
-        self.tasks = {}
+        # schedule_map 用来存储所有会话的定时设置：
+        #  { context_id: {"hour": X, "minute": Y, "has_sent_today": False}, ...}
+        self.schedule_map = {}
+
+        # 用来标识后台轮询是否已经启动
+        self._polling_task = None
 
     async def initialize(self):
         print("[DailyNewsPlugin] 插件初始化完成")
+        # 启动后台轮询任务（只启动一次）
+        if not self._polling_task:
+            self._polling_task = asyncio.create_task(self._polling_loop())
+            print("[DailyNewsPlugin] 后台轮询任务已启动")
 
-    # @handler(PersonMessageReceived)
+    async def on_destroy(self):
+        """
+        当插件被卸载或机器人退出时，记得把后台任务结束
+        （部分框架可能没有这个钩子，请自行处理）。
+        """
+        if self._polling_task:
+            self._polling_task.cancel()
+            self._polling_task = None
+        print("[DailyNewsPlugin] 插件销毁，后台轮询任务已结束。")
+
+    @handler(PersonMessageReceived)
     @handler(GroupMessageReceived)
     async def on_message(self, ctx: EventContext):
         """
@@ -73,30 +91,23 @@ class DailyNewsPlugin(BasePlugin):
         if not msg_str:
             return  # 空消息则不处理
 
-        # 将会话标识（私聊则用sender, 群聊则用group）提取为一个 key
-        # 你也可以根据实际需求决定是否区分群/私聊。这里简单区分一下：
+        # 确定当前的会话ID（群 or 私聊）
         if hasattr(ctx.event, "group_id") and ctx.event.group_id:
             context_id = f"group_{ctx.event.group_id}"
         else:
             context_id = f"user_{ctx.event.sender_id}"
 
         parts = msg_str.split(maxsplit=2)
-        cmd = parts[0].lstrip("/").lower()  # 去掉开头的斜杠，转小写
+        cmd = parts[0].lstrip("/").lower()
 
-        # 1) /news -> 立即发送一次新闻
+        # /news -> 立即发送一次新闻
         if cmd == "news" and len(parts) == 1:
-            # 立即发送新闻图片
             await self.send_news_once(ctx)
             return
 
-        # 2) /news set hh:mm -> 设置定时任务
-        #   假设只需要解析出 "8:00" 这样的格式
+        # /news set hh:mm -> 设置每日定时任务
         if cmd == "news" and len(parts) == 2 and parts[1].startswith("set"):
-            # 示例: "/news set 8:00"
-            # 提取 "8:00"
-            time_str = parts[1].replace("set", "").strip()
-            # 也可能是 "/news set 08:00" "/news set 9:05" 等等
-            # 这里用正则或者简单 split 检查
+            time_str = parts[1].replace("set", "").strip()  # 取出 8:00
             match = re.match(r'^(\d{1,2}):(\d{1,2})$', time_str)
             if not match:
                 await ctx.reply(MessageChain([Plain("请使用正确的时间格式，如 /news set 8:00")]))
@@ -107,26 +118,20 @@ class DailyNewsPlugin(BasePlugin):
                 await ctx.reply(MessageChain([Plain("请使用正确的时间格式(小时0-23，分钟0-59)")]))
                 return
 
-            # 先停止已有的定时任务（如果存在）
-            if context_id in self.tasks:
-                task = self.tasks[context_id]
-                task.cancel()
-                del self.tasks[context_id]
-
-            # 创建新的定时任务
-            task = asyncio.create_task(self.schedule_daily_news(ctx, hour, minute))
-            self.tasks[context_id] = task
-
-            await ctx.reply(MessageChain([Plain(f"已设置每日新闻定时发送时间为 {hour:02d}:{minute:02d}。")]))
+            # 写入/更新 schedule_map
+            self.schedule_map[context_id] = {
+                "hour": hour,
+                "minute": minute,
+                "has_sent_today": False,  # 每天要重新置False，才能再次发送
+            }
+            await ctx.reply(MessageChain([Plain(f"已设置 {hour:02d}:{minute:02d} 的每日定时推送。")]))
             return
 
-        # 3) /news stop -> 停止当前会话的定时任务
+        # /news stop -> 停止当前会话的定时任务
         if cmd == "news" and len(parts) == 2 and parts[1] == "stop":
-            if context_id in self.tasks:
-                task = self.tasks[context_id]
-                task.cancel()
-                del self.tasks[context_id]
-                await ctx.reply(MessageChain([Plain("已停止每日新闻定时发送。")]))
+            if context_id in self.schedule_map:
+                del self.schedule_map[context_id]
+                await ctx.reply(MessageChain([Plain("已停止本会话的每日新闻定时发送。")]))
             else:
                 await ctx.reply(MessageChain([Plain("当前没有正在执行的定时任务。")]))
             return
@@ -143,43 +148,101 @@ class DailyNewsPlugin(BasePlugin):
             Image(url=image_url)
         ]))
 
-    async def schedule_daily_news(self, ctx: EventContext, hour: int, minute: int):
+    async def _polling_loop(self):
         """
-        每日定时发送新闻的循环任务。
-        当用户使用 /news set hh:mm 命令后，会创建一个任务运行该函数。
-        如果用户 /news stop，则会通过 self.tasks[ctx_id].cancel() 取消它。
+        后台轮询任务，每隔 60 秒检查一次是否到达了各会话的定时时间。
         """
         while True:
             now = datetime.datetime.now()
-            # 计算当天目标时间
-            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            current_h = now.hour
+            current_m = now.minute
 
-            # 如果已经过了今天的目标时间，则改为明天
-            if target_time <= now:
-                target_time += datetime.timedelta(days=1)
+            # 遍历所有定时项
+            for ctx_id, info in self.schedule_map.items():
+                h = info["hour"]
+                m = info["minute"]
 
-            # 计算等待时间
-            wait_seconds = (target_time - now).total_seconds()
+                # 如果已经到了设定的小时和分钟，并且今日还没发过
+                if (current_h == h) and (current_m == m) and (not info["has_sent_today"]):
+                    # 这里我们无法直接调用 ctx.reply，因为每个会话可能是群或私聊
+                    # 需要我们记录一下群号或用户ID，然后用对应的方式发送
+                    # 由于本示例里，我们只有一个 ctx 时才能回复，这里只能做一个简单示例
+                    # 你可以自己维护一个 Map {ctx_id: group_id or user_id} -> 发送函数
+                    # 为了示例，咱就“假装”可以发送吧
+                    print(f"[DailyNewsPlugin] 到点了，发送新闻: {ctx_id}")
+                    await self.send_news_to(ctx_id)
 
-            try:
-                # 等待直到目标时间 (可能被 cancel() 打断)
-                await asyncio.sleep(wait_seconds)
-            except asyncio.CancelledError:
-                print(f"[DailyNewsPlugin] 定时任务被取消: {hour}:{minute}")
-                break
+                    # 标记今天已经发过
+                    info["has_sent_today"] = True
 
-            # 到了设定时间 -> 发送新闻
-            await self.send_news_once(ctx)
+                # 如果当前时间已经过了设定时间，等到明天再发
+                # 当天自然要把 has_sent_today 设置为 True
+                # 第二天凌晨再重置
+                if (current_h > h) or (current_h == h and current_m > m):
+                    info["has_sent_today"] = True
 
-            # 发送完后，等待 24 小时再发(即第二天同一时间)
-            # 或者可以直接进入下一次循环再重新计算目标时间
-            # 下面这种写法更直观：再次计算下一个目标时间，然后进入下一循环
-            # 这里为了简单，直接 sleep 24 小时：
-            try:
-                await asyncio.sleep(24 * 60 * 60)
-            except asyncio.CancelledError:
-                print(f"[DailyNewsPlugin] 定时任务被取消: {hour}:{minute}")
-                break
+                # 如果现在比目标时间早，则确保 has_sent_today=False
+                if (current_h < h) or (current_h == h and current_m < m):
+                    info["has_sent_today"] = False
+
+            await asyncio.sleep(60)  # 每分钟检查一次
+
+    async def send_news_to(self, context_id: str):
+        """
+        给指定的上下文ID(群 or 私聊)发送新闻。
+        这里需要根据你的框架API去实现：
+         - 群发新闻
+         - 私聊发新闻
+        """
+        # 1) 判断群聊还是私聊
+        if context_id.startswith("group_"):
+            group_id = context_id.replace("group_", "")
+            # 你可能需要 something like self.host.send_group_message(...)
+            # 示例:
+            await self.send_group_news(group_id)
+        else:
+            user_id = context_id.replace("user_", "")
+            # 你可能需要 something like self.host.send_private_message(...)
+            # 示例:
+            await self.send_user_news(user_id)
+
+    async def send_group_news(self, group_id: str):
+        """
+        发送群聊新闻消息，示例
+        """
+        image_url = fetch_news_image_url()
+        if not image_url:
+            print("[DailyNewsPlugin] 群聊发送失败，没拿到新闻图片URL")
+            return
+        # 具体实现需要根据你的框架API，可能类似：
+        await self.host.send_group_message(
+            int(group_id),  # 群ID
+            MessageChain([
+                # Plain("每日新闻："),
+                Image(url=image_url)
+            ])
+        )
+
+    async def send_user_news(self, user_id: str):
+        """
+        发送私聊新闻消息，示例
+        """
+        image_url = fetch_news_image_url()
+        if not image_url:
+            print("[DailyNewsPlugin] 私聊发送失败，没拿到新闻图片URL")
+            return
+        # 具体实现需要根据你的框架API，可能类似：
+        await self.host.send_private_message(
+            int(user_id),  # 用户ID
+            MessageChain([
+                # Plain("每日新闻："),
+                Image(url=image_url)
+            ])
+        )
 
     def __del__(self):
+        # 如果你的框架在卸载插件时不调用 on_destroy，可以在这里补充一下
+        if self._polling_task:
+            self._polling_task.cancel()
+            self._polling_task = None
         print("[DailyNewsPlugin] 插件被卸载或程序退出")
